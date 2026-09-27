@@ -1,19 +1,108 @@
-export type Stop = { id: string; name: string; lat: number; lon: number; platform?: string }
-export type Trip = { id: string; route: string; headsign: string; color: string; stops: string[]; times: string[] }
-export const gtfsSql = `CREATE TABLE stops (stop_id TEXT PRIMARY KEY, stop_name TEXT NOT NULL, stop_lat REAL, stop_lon REAL, platform_code TEXT);
-CREATE TABLE routes (route_id TEXT PRIMARY KEY, route_short_name TEXT NOT NULL, route_long_name TEXT, route_type INTEGER, route_color TEXT);
-CREATE TABLE trips (trip_id TEXT PRIMARY KEY, route_id TEXT REFERENCES routes, trip_headsign TEXT, service_id TEXT);
-CREATE TABLE stop_times (trip_id TEXT REFERENCES trips, arrival_time TEXT, departure_time TEXT, stop_id TEXT REFERENCES stops, stop_sequence INTEGER, PRIMARY KEY(trip_id, stop_sequence));`
-export const stops: Stop[] = [
-  { id:'HDC', name:'Hohenbrück Central', lat:51.243, lon:6.782, platform:'1–4' }, { id:'RAT', name:'Rathaus', lat:51.229, lon:6.775, platform:'A–D' },
-  { id:'HAF', name:'Hafen / Waterfront', lat:51.218, lon:6.765, platform:'1–2' }, { id:'LIN', name:'Lindenplatz', lat:51.235, lon:6.801, platform:'A–B' },
-  { id:'UNI', name:'Universität', lat:51.246, lon:6.754, platform:'1–2' }, { id:'OST', name:'Osttor', lat:51.235, lon:6.832, platform:'1–3' },
-]
-export const trips: Trip[] = [
-  { id:'S1-1201', route:'S1', headsign:'Hafen', color:'#243d48', stops:['HDC','LIN','RAT','HAF'], times:['12:01','12:06','12:12','12:19'] },
-  { id:'U7-1204', route:'U7', headsign:'Osttor', color:'#df493d', stops:['UNI','HDC','RAT','OST'], times:['12:04','12:09','12:15','12:22'] },
-  { id:'T19-1210', route:'T19', headsign:'Lindenplatz', color:'#e7a635', stops:['HAF','RAT','LIN'], times:['12:10','12:15','12:21'] },
-  { id:'F32-1220', route:'F32', headsign:'Hafen', color:'#1984a3', stops:['HDC','HAF'], times:['12:20','12:31'] },
-  { id:'U7-1234', route:'U7', headsign:'Osttor', color:'#df493d', stops:['UNI','HDC','RAT','OST'], times:['12:34','12:39','12:45','12:52'] },
-]
-export function findJourneys(from: string, to: string) { const a=stops.find(s=>s.id===from||s.name.toLowerCase().includes(from.toLowerCase())); const b=stops.find(s=>s.id===to||s.name.toLowerCase().includes(to.toLowerCase())); if(!a||!b)return []; return trips.filter(t=>t.stops.indexOf(a.id)>=0&&t.stops.indexOf(b.id)>t.stops.indexOf(a.id)).map(t=>{const i=t.stops.indexOf(a.id),j=t.stops.indexOf(b.id);return {...t,depart:t.times[i],arrive:t.times[j],duration:`${j-i} stop${j-i>1?'s':''}`}}) }
+/**
+ * GTFS feed generator for the RMA network.
+ *
+ * Everything is derived from src/lib/network.ts, so the published feed and the
+ * website can never disagree. Times are written in the service-day format GTFS
+ * expects, where hours may exceed 23: a departure at 24:35 is written as
+ * "24:35:00" rather than wrapping to "00:35:00".
+ */
+import {
+  gtfsTime,
+  lineDirections,
+  lines,
+  readableTextColor,
+  routeType,
+  serviceSettings,
+  stationById,
+  stations,
+  tripTimes,
+} from './network.ts'
+
+export type GtfsFile = { name: string; rows: number; content: string }
+
+/** Builds a CSV document, quoting values that contain commas, quotes or newlines. */
+function csv(rows: Array<Array<string | number>>): string {
+  return rows
+    .map((row) =>
+      row
+        .map((value) => {
+          const text = String(value)
+          return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
+        })
+        .join(','),
+    )
+    .join('\n')
+}
+
+function file(name: string, rows: Array<Array<string | number>>): GtfsFile {
+  return { name, rows: rows.length - 1, content: csv(rows) }
+}
+
+const pad = (value: number, length = 3): string => String(value).padStart(length, '0')
+const hex = (color: string): string => color.replace('#', '').toUpperCase()
+
+/** Builds every file of the RMA GTFS feed, including row counts for the open-data page. */
+export function buildGtfsFiles(): GtfsFile[] {
+  const tripRows: Array<Array<string | number>> = [['route_id', 'service_id', 'trip_id', 'trip_headsign', 'trip_short_name', 'direction_id', 'shape_id', 'wheelchair_accessible', 'bikes_allowed']]
+  const stopTimeRows: Array<Array<string | number>> = [['trip_id', 'arrival_time', 'departure_time', 'stop_id', 'stop_sequence', 'stop_headsign', 'timepoint']]
+  const shapeRows: Array<Array<string | number>> = [['shape_id', 'shape_pt_lat', 'shape_pt_lon', 'shape_pt_sequence']]
+  const frequencyRows: Array<Array<string | number>> = [['trip_id', 'start_time', 'end_time', 'headway_secs', 'exact_times']]
+
+  for (const line of lines) {
+    const departures = tripTimes(line)
+    for (const direction of lineDirections(line)) {
+      const suffix = direction.id === 0 ? 'A' : 'B'
+      const shapeId = `${line.id}-${suffix}`
+      const tripId = (index: number): string => `${line.id}-${suffix}-${pad(index + 1)}`
+
+      // One shape point per station in travel order. Surveyed alignments replace
+      // these station-to-station segments in the production feed.
+      direction.stops.forEach((stationId, index) => {
+        const station = stationById(stationId)
+        if (station) shapeRows.push([shapeId, station.lat, station.lon, index + 1])
+      })
+
+      departures.forEach((departure, index) => {
+        tripRows.push([line.id, serviceSettings.serviceId, tripId(index), direction.headsign, line.description, direction.id, shapeId, 1, 1])
+        direction.stops.forEach((stationId, stopIndex) => {
+          const time = gtfsTime(departure + stopIndex * line.travelTime)
+          stopTimeRows.push([tripId(index), time, time, stationId, stopIndex + 1, direction.headsign, 1])
+        })
+      })
+
+      const last = departures[departures.length - 1]
+      if (departures.length > 1 && last !== undefined) frequencyRows.push([tripId(0), gtfsTime(departures[0]), gtfsTime(last), line.frequency * 60, 1])
+    }
+  }
+
+  return [
+    file('agency.txt', [
+      ['agency_id', 'agency_name', 'agency_url', 'agency_timezone', 'agency_lang'],
+      [serviceSettings.agencyId, serviceSettings.authorityName, serviceSettings.feedPublisherUrl, serviceSettings.timezone, serviceSettings.feedLang],
+    ]),
+    file('stops.txt', [
+      ['stop_id', 'stop_name', 'stop_lat', 'stop_lon', 'platform_code'],
+      ...stations.map((station) => [station.id, station.name, station.lat, station.lon, station.platform]),
+    ]),
+    file('routes.txt', [
+      ['route_id', 'agency_id', 'route_short_name', 'route_long_name', 'route_type', 'route_color', 'route_text_color'],
+      ...lines.map((line) => [line.id, serviceSettings.agencyId, line.id, line.name, routeType[line.mode], hex(line.color), hex(readableTextColor(line.color))]),
+    ]),
+    file('calendar.txt', [
+      ['service_id', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday', 'start_date', 'end_date'],
+      [serviceSettings.serviceId, 1, 1, 1, 1, 1, 1, 1, serviceSettings.calendarStart, serviceSettings.calendarEnd],
+    ]),
+    file('trips.txt', tripRows),
+    file('stop_times.txt', stopTimeRows),
+    file('frequencies.txt', frequencyRows),
+    file('shapes.txt', shapeRows),
+    file('feed_info.txt', [
+      ['feed_publisher_name', 'feed_publisher_url', 'feed_lang', 'default_lang', 'feed_start_date', 'feed_end_date', 'feed_version'],
+      [serviceSettings.feedPublisherName, serviceSettings.feedPublisherUrl, serviceSettings.feedLang, serviceSettings.feedLang, serviceSettings.calendarStart, serviceSettings.calendarEnd, serviceSettings.feedVersion],
+    ]),
+  ]
+}
+
+/** File names and row counts, for the open-data list on the network page. */
+export const gtfsSummary = (): Array<{ name: string; rows: number }> =>
+  buildGtfsFiles().map(({ name, rows }) => ({ name, rows }))
